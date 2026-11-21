@@ -30,6 +30,51 @@ import java.util.Locale
 
 class SawtoothOnlineAggregatorTest extends TestCase {
 
+  def testBatchBoundariesWithHourTailHops(): Unit = {
+    checkBatchBoundaries(Seq(new Window(3, TimeUnit.DAYS), new Window(7, TimeUnit.DAYS)))
+  }
+
+  def testBatchBoundariesWithDayTailHops(): Unit = {
+    checkBatchBoundaries(Seq(new Window(14, TimeUnit.DAYS), new Window(15, TimeUnit.DAYS)))
+  }
+
+  private def checkBatchBoundaries(windows: Seq[Window]): Unit = {
+    val batchEndTs = 1746921600000L // 2025-05-11 00:00:00 UTC
+    val tailBuffer = 2 * WindowUtils.Day.millis
+    val schema = Seq("ts" -> LongType, "num" -> LongType)
+    val aggregations = Seq(Builders.Aggregation(Operation.COUNT, "num", windows))
+    val online = new SawtoothOnlineAggregator(batchEndTs, aggregations, schema)
+    val tailHops = windows.map(FiveMinuteResolution.calculateTailHop).toArray
+    val naive = new NaiveAggregator(online.windowedAggregator, windows.toArray, tailHops)
+    val queries = (Seq(batchEndTs, batchEndTs + 1, batchEndTs + WindowUtils.FiveMinutes - 1) ++
+      tailHops.flatMap(hop => Seq(batchEndTs + hop - 1, batchEndTs + hop))).distinct.sorted
+    val timestamps = (windows.flatMap { window =>
+      val tail = batchEndTs - window.millis
+      Seq(tail - 1, tail, tail + 1,
+          tail + tailBuffer - 1, tail + tailBuffer, tail + tailBuffer + 1)
+    } ++ Seq(batchEndTs - 1, batchEndTs, batchEndTs + 1,
+             batchEndTs + WindowUtils.FiveMinutes - 1)).distinct.sorted
+    val events = timestamps.map(ts => TestRow(ts, 1L)).toArray
+    val gson = new Gson
+
+    // Check each boundary in isolation as well as shared hops across windows.
+    // A single event must contribute either zero or one, never twice.
+    for (input <- Seq(events) ++ events.map(row => Array(row))) {
+      val (left, right) = input.splitAt(input.length / 2)
+      val batch = online.merge(left.foldLeft(online.init)(online.update),
+                               right.foldLeft(online.init)(online.update))
+      val finalBatch = online.denormalizeBatchIr(online.normalizeBatchIr(batch))
+      val expected = naive.aggregate(input, queries)
+      for (i <- queries.indices) {
+        // Include batch rows in the stream to verify filtering at batchEndTs.
+        val actual = online.lambdaAggregateFinalized(finalBatch, input.iterator, queries(i))
+        assertEquals(s"windows=$windows query=${queries(i)} events=${input.map(_.ts).mkString(",")}",
+                     gson.toJson(online.windowedAggregator.finalize(expected(i))),
+                     gson.toJson(actual))
+      }
+    }
+  }
+
   def testConsistency(): Unit = {
     val queryEndTs = TsUtils.round(System.currentTimeMillis(), WindowUtils.Day.millis)
     val batchEndTs = queryEndTs - WindowUtils.Day.millis
