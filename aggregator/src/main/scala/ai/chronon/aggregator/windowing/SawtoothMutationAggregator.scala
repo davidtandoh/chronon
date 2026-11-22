@@ -77,7 +77,7 @@ class SawtoothMutationAggregator(aggregations: Seq[Aggregation],
 
     var i = 0
     while (i < windowedAggregator.length) {
-      if (batchEndTs > rowTs && batchTails(i).forall(rowTs > _)) { // relevant for the window
+      if (batchEndTs > rowTs && batchTails(i).forall(rowTs >= _)) { // relevant for the window
         if (batchTails(i).forall(rowTs >= _ + tailBufferMillis)) { // update collapsed part
           windowedAggregator.columnAggregators(i).update(batchIr.collapsed, row)
         } else { // update tailHops part
